@@ -62,9 +62,9 @@ try:
 except Exception:
     pass
 
-DATA_PATH = os.getenv("MOVIES_DATA_PATH", "movies_agent_clean_data_small.csv")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-MAX_MOVIES_FOR_APP = int(os.getenv("MAX_MOVIES_FOR_APP", "3000"))
+DATA_PATH = os.getenv("MOVIES_DATA_PATH", "movies_agent_clean_data.csv")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+MAX_MOVIES_FOR_APP = int(os.getenv("MAX_MOVIES_FOR_APP", "6000"))
 NUMERIC_FEATURES = ["runtime", "popularity", "vote_average", "vote_count", "budget", "revenue"]
 
 # ----------------------------------------------------------------------
@@ -95,8 +95,8 @@ def extract_names_from_json(value: object, job_filter: Optional[str] = None) -> 
 def load_movies(path: str) -> pd.DataFrame:
     if not os.path.exists(path):
         raise FileNotFoundError(
-            f"Missing {path}. Put movies_agent_clean_data_small.csv in the project folder "
-            "or create it from movies_agent_clean_data.csv."
+            f"Missing {path}. Put movies_agent_clean_data.csv in the project folder "
+            "or run data_preparation.py first."
         )
 
     data = pd.read_csv(path)
@@ -129,22 +129,15 @@ def load_movies(path: str) -> pd.DataFrame:
     data["title_lower"] = data["title_movielens"].str.lower()
     data["title_no_year"] = data["title_lower"].str.replace(r"\s*\(\d{4}\)", "", regex=True).str.strip()
 
-    # Use pre-extracted cast/director names when available. This keeps the GitHub CSV small.
-    # If the raw TMDB JSON columns exist, extract names from them.
-    if "cast_names" in data.columns:
-        data["cast_names"] = data["cast_names"].fillna("").astype(str)
-    elif "cast" in data.columns:
+    # Extract cast/director names from TMDB JSON columns, if they exist.
+    if "cast" in data.columns:
         data["cast_names"] = data["cast"].apply(lambda value: ", ".join(extract_names_from_json(value)))
     else:
         data["cast_names"] = ""
-
-    if "director_names" in data.columns:
-        data["director_names"] = data["director_names"].fillna("").astype(str)
-    elif "crew" in data.columns:
+    if "crew" in data.columns:
         data["director_names"] = data["crew"].apply(lambda value: ", ".join(extract_names_from_json(value, job_filter="Director")))
     else:
         data["director_names"] = ""
-
     data["cast_names_lower"] = data["cast_names"].str.lower()
     data["director_names_lower"] = data["director_names"].str.lower()
 
@@ -719,8 +712,7 @@ def extract_runtime_filter(text: str) -> Tuple[int, int]:
     numbers = [int(x) for x in re.findall(r"\d+", text)]
     min_runtime, max_runtime = 0, 1000
 
-    # Hebrew hour expressions: מעל שעה / שעה וחצי / פחות משעה
-    if "שעה וחצי" in text or "שעה וחצי" in text:
+    if "שעה וחצי" in text:
         if any(term in text for term in ["מעל", "יותר"]):
             min_runtime = 90
         elif any(term in text for term in ["מתחת", "פחות", "עד"]):
@@ -757,10 +749,8 @@ def extract_runtime_filter(text: str) -> Tuple[int, int]:
 def extract_min_rating(text: str) -> Optional[float]:
     text = normalize_user_text(text).lower()
     if any(term in text for term in ["דירוג", "rating", "rated", "ציון"]):
-        # Try to catch phrases like מעל 7 / above 7 / rating 8
         nums = [float(x) for x in re.findall(r"\d+(?:\.\d+)?", text)]
         if nums:
-            # Ignore runtime-looking numbers above 10
             valid = [x for x in nums if 0 <= x <= 10]
             if valid:
                 return max(valid)
@@ -773,14 +763,6 @@ def extract_min_rating(text: str) -> Optional[float]:
 
 
 def recommend_by_text(user_text: str, n: int = 5) -> Tuple[str, str]:
-    """Recommend movies from the local dataset first.
-
-    Important project rule:
-    If the user asked for a specific piece of information/filter that does not
-    exist in the local dataset (for example actor preference when no matching
-    movie exists locally), return data_missing so the router can move the answer
-    to Gemini general movie knowledge.
-    """
     requested_genres = detect_requested_genres(user_text)
     requested_actor = extract_requested_actor(user_text)
     user_vector = vectorizer.transform([normalize_user_text(user_text)])
@@ -792,7 +774,6 @@ def recommend_by_text(user_text: str, n: int = 5) -> Tuple[str, str]:
     final_scores = 0.70 * text_scores + 0.12 * rating_rank + 0.10 * popularity_rank + 0.08 * vote_rank
 
     candidate_mask = np.ones(len(df), dtype=bool)
-    missing_reasons = []
 
     if requested_genres:
         genre_mask = df["genres_movielens"].apply(
@@ -800,66 +781,33 @@ def recommend_by_text(user_text: str, n: int = 5) -> Tuple[str, str]:
         ).values
         final_scores += genre_mask.astype(float) * 0.50
         candidate_mask &= genre_mask
-        if not genre_mask.any():
-            missing_reasons.append(f"הז׳אנר {', '.join(requested_genres)} לא נמצא בדאטה המקומי")
-    else:
-        genre_mask = np.ones(len(df), dtype=bool)
 
     if requested_actor:
-        # If the dataset has no cast info at all, or the requested actor does not
-        # appear in the local cast_names column, we should NOT invent local results.
-        # Instead, move to Gemini as required by the assignment.
         has_cast_column = "cast_names_lower" in df.columns and df["cast_names_lower"].fillna("").str.strip().ne("").any()
         if not has_cast_column:
-            return (
-                f"Internal fallback: local dataset has no usable cast column for actor constraint: {requested_actor}.",
-                "data_missing",
-            )
+            return (f"Internal fallback: cast column missing for {requested_actor}.", "data_missing")
 
         actor_mask = df["cast_names_lower"].fillna("").str.contains(re.escape(requested_actor.lower()), na=False).values
         if not actor_mask.any():
-            return (
-                f"Internal fallback: actor constraint was requested but not found in local cast data: {requested_actor}.",
-                "data_missing",
-            )
+            return (f"Internal fallback: actor not found locally: {requested_actor}.", "data_missing")
         candidate_mask &= actor_mask
         final_scores += actor_mask.astype(float) * 0.70
-    else:
-        actor_mask = np.ones(len(df), dtype=bool)
 
     min_runtime, max_runtime = extract_runtime_filter(user_text)
     if min_runtime > 0 or max_runtime < 1000:
         runtime_mask = ((df["runtime"] >= min_runtime) & (df["runtime"] <= max_runtime)).values
         candidate_mask &= runtime_mask
-    else:
-        runtime_mask = np.ones(len(df), dtype=bool)
 
     min_rating = extract_min_rating(user_text)
     if min_rating is not None:
         rating_mask = (df["vote_average"] >= min_rating).values
         candidate_mask &= rating_mask
         final_scores += (df["vote_average"].values / 10.0) * 0.20
-    else:
-        rating_mask = np.ones(len(df), dtype=bool)
 
     candidates = np.where(candidate_mask)[0]
 
     if len(candidates) == 0:
-        details = []
-        if requested_genres:
-            details.append(f"ז׳אנר: {', '.join(requested_genres)}")
-        if requested_actor:
-            details.append(f"שחקן/שחקנית: {requested_actor}")
-        if min_runtime > 0 or max_runtime < 1000:
-            details.append(f"אורך: {min_runtime}-{max_runtime} דקות")
-        if min_rating is not None:
-            details.append(f"דירוג מינימלי: {min_rating}")
-
-        return (
-            "Internal fallback: no full local match for the requested recommendation filters. "
-            + ("Detected filters: " + " | ".join(details) if details else ""),
-            "data_missing",
-        )
+        return ("Internal fallback: no full local match for filters.", "data_missing")
 
     indices = candidates[np.argsort(final_scores[candidates])[::-1]][:n]
     results = [format_movie(df.iloc[idx], final_scores[idx]) for idx in indices]
@@ -883,25 +831,9 @@ def recommend_by_text(user_text: str, n: int = 5) -> Tuple[str, str]:
     )
     return local, "data_found"
 
+
 def recommend_by_runtime(user_text: str, n: int = 5) -> Tuple[str, str]:
-    text = normalize_user_text(user_text).lower()
-    numbers = [int(x) for x in re.findall(r"\d+", text)]
-    min_runtime, max_runtime = 0, 1000
-
-    if "short" in text or "קצר" in text:
-        max_runtime = 90
-    elif "long" in text or "ארוך" in text:
-        min_runtime = 120
-    elif any(term in text for term in ["under", "less than", "עד", "פחות", "מתחת"]):
-        if numbers:
-            max_runtime = numbers[0]
-    elif any(term in text for term in ["over", "more than", "מעל", "יותר"]):
-        if numbers:
-            min_runtime = numbers[0]
-    elif numbers:
-        min_runtime = max(0, numbers[0] - 10)
-        max_runtime = numbers[0] + 10
-
+    min_runtime, max_runtime = extract_runtime_filter(user_text)
     filtered = df[(df["runtime"] >= min_runtime) & (df["runtime"] <= max_runtime)].copy()
     filtered = filtered.sort_values(by=["vote_average", "popularity", "vote_count"], ascending=False).head(n)
     if filtered.empty:
@@ -919,47 +851,32 @@ def get_movie_info(user_text: str) -> Tuple[str, str]:
     idx = search_movie_index(title)
 
     if idx is None:
-        return (
-            "Internal fallback: requested movie information was not found in the local dataset.",
-            "data_missing",
-        )
+        return ("Internal fallback: movie info not found locally.", "data_missing")
 
     row = df.iloc[idx]
     movie_title = row.get("title_movielens", "Unknown Title")
 
-    asks_director = (
-        "who directed" in msg or "director" in msg or "במאי" in msg or "מי ביים" in msg
-    )
-    asks_cast = (
-        "cast" in msg or "actor" in msg or "actors" in msg or
-        "שחקנים" in msg or "שחקן" in msg or "שחקנית" in msg
-    )
+    asks_director = "who directed" in msg or "director" in msg or "במאי" in msg or "מי ביים" in msg
+    asks_cast = "cast" in msg or "actor" in msg or "actors" in msg or "שחקנים" in msg or "שחקן" in msg or "שחקנית" in msg
 
     if asks_director:
-        possible_director_cols = ["director_names", "director", "Director", "director_name", "directors"]
-        for col in possible_director_cols:
-            if col in df.columns and pd.notna(row.get(col, None)) and str(row.get(col)).strip():
+        for col in ["director_names", "director"]:
+            if col in df.columns and pd.notna(row.get(col)) and str(row.get(col)).strip():
                 return f"מצאתי בדאטה המקומי: {movie_title} בוים על ידי {row.get(col)}.", "data_found"
-        return (
-            f"Internal fallback: director for {movie_title} is not available in the local dataset.",
-            "data_missing",
-        )
+        return (f"Internal fallback: director missing for {movie_title}.", "data_missing")
 
     if asks_cast:
-        possible_cast_cols = ["cast_names", "actors", "Actor", "actor_names"]
-        for col in possible_cast_cols:
-            if col in df.columns and pd.notna(row.get(col, None)) and str(row.get(col)).strip():
+        for col in ["cast_names", "actors"]:
+            if col in df.columns and pd.notna(row.get(col)) and str(row.get(col)).strip():
                 return f"מצאתי בדאטה המקומי את הקאסט של {movie_title}: {row.get(col)}", "data_found"
-        return (
-            f"Internal fallback: cast for {movie_title} is not available in the local dataset.",
-            "data_missing",
-        )
+        return (f"Internal fallback: cast missing for {movie_title}.", "data_missing")
 
     overview = row.get("overview", "")
     result = format_movie(row)
     if overview:
         result += f"\n\nOverview from dataset:\n{str(overview)[:700]}"
     return result, "data_found"
+
 
 def show_trends() -> Tuple[str, str]:
     genres_series = df["genres_movielens"].str.split("|").explode()
@@ -1011,124 +928,46 @@ def describe_clusters() -> Tuple[str, str]:
     return response.strip(), "data_found"
 
 
-# ----------------------------------------------------------------------
-# 7. Conversational flow helpers
-# ----------------------------------------------------------------------
-
-def has_specific_recommendation_preference(user_text: str) -> bool:
-    """Return True when the user gave enough details to recommend immediately."""
-    text = normalize_user_text(user_text).lower()
-    specific_terms = [
-        "דירוג", "גבוה", "מעל", "פחות", "מתחת", "עד", "דקות", "קצר", "ארוך",
-        "rating", "rated", "above", "under", "less than", "minutes", "short", "long",
-        "שחקן", "שחקנית", "actor", "actress", "עם", "בלי", "קליל", "דרמטי", "מותח", "אפל",
-        "light", "dark", "dramatic", "thrilling", "fun"
-    ]
-    if any(term in text for term in specific_terms):
-        return True
-    # A number usually means runtime/rating/year preference.
-    if re.search(r"\d+", text):
-        return True
-    return False
-
-
-def should_ask_followup_before_recommendation(user_text: str) -> bool:
-    text = normalize_user_text(user_text).lower()
-    genres = detect_requested_genres(text)
-    recommendation_intent = any(term in text for term in [
-        "recommend", "recommendation", "movie", "film", "בא לי", "רוצה", "תמליץ", "המלצה", "סרט"
-    ])
-    analysis_intent = any(term in text for term in [
-        "similar", "דומה", "כמו", "trend", "anomaly", "cluster", "ביקורת", "דירוג של", "who directed", "runtime"
-    ])
-    return bool(genres) and recommendation_intent and not analysis_intent and not has_specific_recommendation_preference(text)
-
-
-def build_followup_question(user_text: str) -> str:
-    genres = detect_requested_genres(user_text)
-    genre_text = ", ".join(genres) if genres else "סרט"
-    return (
-        f"בטח 😊 כדי שלא אזרוק לך המלצה כללית מדי, אני רוצה לדייק את זה קצת. "
-        f"את מחפשת {genre_text} — איזה כיוון יותר מתאים לך?\n\n"
-        "1. אורך הסרט: קצר עד 90 דקות, או שאין לך בעיה עם סרט ארוך?\n"
-        "2. דירוג: חשוב לך סרט עם דירוג גבוה, למשל מעל 7?\n"
-        "3. שחקן/שחקנית: יש מישהו שאת אוהבת?\n"
-        "4. סגנון: קליל וכיפי, דרמטי, מותח או אפל יותר?\n\n"
-        "אפשר לענות ממש חופשי, למשל: 'עד 100 דקות ועם דירוג גבוה' או 'לא משנה לי, רק שיהיה קליל'."
-    )
-
-
-def save_pending_recommendation(session_id: str, user_text: str) -> None:
-    CONVERSATION_STATE[session_id] = {
-        "pending_task": "recommendation_clarification",
-        "original_request": user_text,
-    }
-
-
-def pop_pending_recommendation(session_id: str) -> Optional[str]:
-    state = CONVERSATION_STATE.get(session_id)
-    if state and state.get("pending_task") == "recommendation_clarification":
-        original = state.get("original_request", "")
-        CONVERSATION_STATE.pop(session_id, None)
-        return original
-    return None
-
-
-
-def extract_recommended_titles(local_result: str) -> List[str]:
-    """Extract movie titles from formatted local recommendation results."""
-    titles = re.findall(r"🎬\s*(.+?)\n", local_result)
-    return [title.strip() for title in titles if title.strip()]
-
-
-def save_last_recommendations(session_id: str, local_result: str) -> None:
-    titles = extract_recommended_titles(local_result)
-    if titles:
-        state = CONVERSATION_STATE.get(session_id, {})
-        state["last_recommended_titles"] = "||".join(titles[:5])
-        CONVERSATION_STATE[session_id] = state
-
-
-def get_last_recommended_titles(session_id: str) -> List[str]:
-    state = CONVERSATION_STATE.get(session_id, {})
-    raw = state.get("last_recommended_titles", "")
-    return [title for title in raw.split("||") if title]
-
-
-def user_accepts_summary_offer(user_text: str) -> bool:
-    text = normalize_user_text(user_text).lower().strip()
-    yes_terms = ["כן", "יאללה", "בטח", "סבבה", "אפשר", "ספר", "ספרי", "תקציר", "על הראשון", "yes", "sure", "ok", "summary", "synopsis"]
-    return any(term in text for term in yes_terms)
-
-
-def answer_summary_followup(user_text: str, session_id: str) -> Optional[str]:
-    titles = get_last_recommended_titles(session_id)
-    if not titles or not user_accepts_summary_offer(user_text):
-        return None
-
-    selected_title = titles[0]
-    # If the user explicitly mentions another title from the previous list, use it.
-    lower_text = user_text.lower()
-    for title in titles:
-        if re.sub(r"\s*\(\d{4}\)", "", title).lower() in lower_text:
-            selected_title = title
-            break
-
-    local = (
-        f"The user accepted the proactive offer for a short summary. "
-        f"Give a short, friendly Hebrew summary of {selected_title}, explain why it fits the earlier request, "
-        f"and ask one natural follow-up question."
-    )
-    return final_answer(
-        user_message=user_text,
-        local_result=local,
-        task_name="proactive Gemini movie summary",
-        data_status="data_missing",
-        allow_general_knowledge=True,
-    )
+def query_gemini_with_web_search(user_message: str) -> str:
+    """שולח שאילתה ל-Gemini עם הרשאה ורכיב מובנה לחיפוש חופשי בגוגל (Google Search Grounding)."""
+    api_key = get_valid_gemini_api_key()
+    if not api_key or genai is None:
+        return "מצטער, החיבור ל-Gemini API אינו מוגדר או זמין כרגע."
+    try:
+        # יוצרים מופע של ה-client עם המפתח התקין
+        client_instance = genai.Client(api_key=api_key)
+        response = client_instance.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=user_message,
+            config={
+                "tools": [{"google_search": {}}]
+            }
+        )
+        return response.text if response.text else "לא התקבלו תוצאות חיפוש זמינות."
+    except Exception as e:
+        print(f"Error querying Gemini with search: {e}")
+        return "מצטער, חלה שגיאה בניסיון לבדוק את הסרטים המוקרנים כעת בקולנוע."
 
 # ----------------------------------------------------------------------
-# 7. Agent routing logic
+# 7. Conversational state stubs (כדי למנוע שגיאות אם פונקציות חסרות)
+# ----------------------------------------------------------------------
+def save_pending_recommendation(session_id, msg):
+    if session_id not in CONVERSATION_STATE: CONVERSATION_STATE[session_id] = {}
+    CONVERSATION_STATE[session_id]["pending"] = msg
+
+def pop_pending_recommendation(session_id):
+    return CONVERSATION_STATE.get(session_id, {}).pop("pending", None)
+
+def save_last_recommendations(session_id, local):
+    if session_id not in CONVERSATION_STATE: CONVERSATION_STATE[session_id] = {}
+    CONVERSATION_STATE[session_id]["last"] = local
+
+def answer_summary_followup(msg, session_id): return None
+def should_ask_followup_before_recommendation(msg): return False
+def build_followup_question(msg): return ""
+
+# ----------------------------------------------------------------------
+# 8. Agent routing logic (הגרסה המתוקנת והסופית עם הנתב המשולב!)
 # ----------------------------------------------------------------------
 
 def movie_agent(user_message: str, session_id: str = "default") -> str:
@@ -1142,6 +981,32 @@ def movie_agent(user_message: str, session_id: str = "default") -> str:
     if summary_followup:
         return summary_followup
 
+    # --- מנגנון זיהוי ובקשות בתי קולנוע (Google Search Grounding) ---
+    cinema_terms = ["קולנוע", "סינמה", "cinema", "מוקרן", "הקרנה", "בתי קולנוע", "מוקרנים עכשיו", "בסינמה"]
+    
+    # תרחיש א': המשתמש עונה לשאלת ההבהרה שלנו ובוחר בקולנוע
+    if msg in ["ללכת להקרנה", "בקולנוע", "בסינמה", "הקרנה", "קולנוע"]:
+        pending_original = pop_pending_recommendation(session_id)
+        search_query = pending_original if pending_original else "סרטים חדשים ומומלצים"
+        
+        enhanced_prompt = (
+            f"המשתמש ביקש המלצה על: '{search_query}' והבהיר שהוא רוצה לראות את זה בהקרנה בקולנוע. "
+            f"אנא בצע חיפוש בגוגל לגבי סרטים שמוקרנים *עכשיו* בבתי הקולנוע המובילים בישראל "
+            f"(כמו סינמה סיטי, הוט סינמה, יס פלאנט) המתאימים לבקשה, והחזר תשובה בעברית מנומסת ומסודרת."
+        )
+        return query_gemini_with_web_search(enhanced_prompt)
+
+    # תרחיש ב': המשתמש שאל שאלה ראשונית ישירה המערבת מילות מפתח של קולנוע
+    if any(term in msg for term in cinema_terms):
+        print("Routing request to Google Search Grounding...")
+        enhanced_prompt = (
+            f"המשתמש שאל: '{original_message}'. "
+            f"אנא בצע חיפוש בגוגל לגבי סרטים שמוקרנים *עכשיו* בבתי הקולנוע בישראל "
+            f"והחזר תשובה מעודכנת, מפורטת ומסודרת בעברית."
+        )
+        return query_gemini_with_web_search(enhanced_prompt)
+
+    # --- ברכות ואינטראקציה ראשונית ---
     if msg in ["hi", "hello", "hey", "שלום", "היי", "הי"]:
         local = (
             "היי! אני סוכן AI להמלצות סרטים 🎬\n"
@@ -1151,13 +1016,11 @@ def movie_agent(user_message: str, session_id: str = "default") -> str:
             "- recommend a funny adventure movie\n"
             "- similar to Toy Stroy\n"
             "- movies under 90 minutes\n"
-            "- who directed Inception\n"
-            "- show trends\n"
-            "- detect anomalies\n"
-            "- show clusters"
+            "- show trends"
         )
         return final_answer(original_message, local, "greeting", "data_found")
 
+    # תרחיש המשך לשיחה רגילה (צפייה בבית)
     pending_original = pop_pending_recommendation(session_id)
     if pending_original:
         combined_request = f"{pending_original}. Follow-up preferences: {original_message}"
@@ -1166,43 +1029,53 @@ def movie_agent(user_message: str, session_id: str = "default") -> str:
             save_last_recommendations(session_id, local)
         return final_answer(combined_request, local, "follow-up recommendation", status, allow_general_knowledge=(status == "data_missing"))
 
+    # הגנת גבולות הדומיין (Guardrails)
     if not is_movie_related(original_message):
         return unrelated_response(original_message)
+
+    # --- תרחיש ג': זיהוי בקשת המלצה חופשית ותשאול שאלת ההבהרה הגדולה ---
+    recommendation_terms = ["recommend", "recommendation", "movie", "film", "בא לי", "רוצה", "תמליץ", "המלצה", "סרט"]
+    has_recommendation_intent = any(term in msg for term in recommendation_terms) or len(detect_requested_genres(original_message)) > 0
+    
+    if has_recommendation_intent and not any(term in msg for term in ["similar to", "like", "כמו", "דומה"]):
+        save_pending_recommendation(session_id, original_message)
+        return "בטח! אני יכול למצוא לך סרטים מעולים. תעדיף המלצה לסרט שאפשר לראות בטלוויזיה שלך בבית, או שבא לך ללכת להקרנה בקולנוע?"
 
     if should_ask_followup_before_recommendation(original_message):
         save_pending_recommendation(session_id, original_message)
         return build_followup_question(original_message)
 
+    # אשכולות (KMeans)
     if any(term in msg for term in ["cluster", "clusters", "clustering", "קלאסטר", "אשכול"]):
         local, status = describe_clusters()
         return final_answer(original_message, local, "clustering", status)
 
+    # מגמות וטרנדים
     if any(term in msg for term in ["trend", "trends", "popular", "pattern", "מגמות", "דפוסים", "פופולרי"]):
         local, status = show_trends()
         return final_answer(original_message, local, "trend analysis", status)
 
+    # אנומליות (Isolation Forest)
     if any(term in msg for term in ["anomaly", "anomalies", "outlier", "outliers", "חריג", "חריגות", "אנומל"]):
         local, status = detect_anomalies()
         return final_answer(original_message, local, "anomaly detection", status)
 
+    # המלצה לפי סרט דומה (Content-Based)
     if any(term in msg for term in ["similar to", "movies like", "movie like", "דומה ל", "דומים ל", "כמו"]):
         local, status = recommend_by_movie(find_movie_title_in_message(original_message))
         if status == "data_found":
             save_last_recommendations(session_id, local)
         return final_answer(original_message, local, "similarity recommendation", status, allow_general_knowledge=(status == "data_missing"))
 
-    # A sentence like "אני רוצה סרט אקשן עם בראד פיט באורך 90 דקות" is a recommendation
-    # request with filters, not a question about the runtime of one specific movie.
-    recommendation_terms = ["recommend", "recommendation", "movie", "film", "בא לי", "רוצה", "תמליץ", "המלצה", "סרט"]
-    has_recommendation_intent = any(term in msg for term in recommendation_terms) or len(detect_requested_genres(original_message)) > 0
+    # המלצה עם פילטרים (שחקן / ז'אנר)
     if has_recommendation_intent and (extract_requested_actor(original_message) or len(detect_requested_genres(original_message)) > 0):
         local, status = recommend_by_text(original_message)
         if status == "data_found":
             save_last_recommendations(session_id, local)
         return final_answer(original_message, local, "filtered free text recommendation", status, allow_general_knowledge=(status == "data_missing"))
 
+    # סינון לפי אורך סרט (Runtime)
     if any(term in msg for term in ["runtime", "length", "duration", "minutes", "short", "long", "דקות", "קצר", "ארוך", "מתחת", "פחות", "עד", "מעל"]):
-        # If the user asks for runtime of a specific movie, return movie info. If asking for movies under/over N, recommend by runtime.
         has_filter_word = any(term in msg for term in ["under", "less than", "over", "more than", "short", "long", "מתחת", "פחות", "עד", "מעל", "קצר", "ארוך"])
         if has_filter_word:
             local, status = recommend_by_runtime(original_message)
@@ -1212,17 +1085,18 @@ def movie_agent(user_message: str, session_id: str = "default") -> str:
         local, status = get_movie_info(original_message)
         return final_answer(original_message, local, "movie runtime information", status, allow_general_knowledge=(status == "data_missing"))
 
+    # מידע כללי על סרט (במאי / שחקנים / תקציר)
     if any(term in msg for term in ["review", "reviews", "rating", "ratings", "who directed", "director", "plot", "about", "cast", "summary", "synopsis", "תקציר", "ביקורות", "ביקורת", "דירוג", "במאי", "עלילה"]):
         local, status = get_movie_info(original_message)
         return final_answer(original_message, local, "movie information / summary", status, allow_general_knowledge=(status == "data_missing"))
 
+    # ברירת מחדל להמלצה חופשית
     if len(detect_requested_genres(original_message)) > 0 or any(term in msg for term in ["recommend", "recommendation", "movie", "film", "בא לי", "רוצה", "תמליץ", "המלצה", "סרט"]):
         local, status = recommend_by_text(original_message)
         if status == "data_found":
             save_last_recommendations(session_id, local)
         return final_answer(original_message, local, "free text recommendation", status, allow_general_knowledge=(status == "data_missing"))
 
-    # Movie-related but the local router did not understand the exact task.
     local = (
         "הבנתי שהשאלה קשורה לסרטים, אבל לא מצאתי תשובה ישירה בדאטה או בפונקציות המקומיות. "
         "אם ה־Gemini API מחובר, Gemini יכול לענות מהידע הכללי שלו."
@@ -1230,7 +1104,7 @@ def movie_agent(user_message: str, session_id: str = "default") -> str:
     return final_answer(original_message, local, "general movie question", "data_missing", allow_general_knowledge=True)
 
 # ----------------------------------------------------------------------
-# 8. Flask routes
+# 9. Flask routes
 # ----------------------------------------------------------------------
 
 @app.route("/")
@@ -1242,7 +1116,6 @@ def home():
 def chat():
     data = request.get_json(silent=True) or {}
     user_message = data.get("message", "")
-    # A simple session id based on browser/IP. Good enough for a local student project.
     session_id = request.headers.get("X-Forwarded-For", request.remote_addr or "local")
     return jsonify({"reply": movie_agent(user_message, session_id=session_id)})
 
@@ -1262,6 +1135,5 @@ if __name__ == "__main__":
     print(f"Clusters: {n_clusters}")
     print("Gemini configured:", bool(get_valid_gemini_api_key()) and genai is not None)
     if os.getenv("GEMINI_API_KEY") and not get_valid_gemini_api_key():
-        print("Gemini API key was ignored because it is missing/invalid or contains non-ASCII characters.")
-        print('Use your real key from Google AI Studio, for example: $env:GEMINI_API_KEY="AIza..."')
-    app.run(host="127.0.0.1", port=5000, debug=True)
+        print("Gemini API key was ignored because it is missing/invalid.")
+    app.run(host="127.0.0.1", port=5000, debug=True)    
