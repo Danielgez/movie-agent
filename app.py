@@ -1229,33 +1229,6 @@ def movie_agent(user_message: str, session_id: str = "default") -> str:
     )
     return final_answer(original_message, local, "general movie question", "data_missing", allow_general_knowledge=True)
 
-# ----------------------------------------------------------------------
-# 8. Flask routes
-# ----------------------------------------------------------------------
-
-@app.route("/")
-def home():
-    return render_template("index.html")
-
-
-@app.route("/chat", methods=["POST"])
-def chat():
-    data = request.get_json(silent=True) or {}
-    user_message = data.get("message", "")
-    # A simple session id based on browser/IP. Good enough for a local student project.
-    session_id = request.headers.get("X-Forwarded-For", request.remote_addr or "local")
-    return jsonify({"reply": movie_agent(user_message, session_id=session_id)})
-
-
-@app.route("/health")
-def health():
-    return jsonify({
-        "status": "ok",
-        "movies_loaded": len(df),
-        "clusters": int(n_clusters),
-        "gemini_configured": bool(get_valid_gemini_api_key()) and genai is not None,
-    })
-
 
 if __name__ == "__main__":
     print(f"Loaded {len(df)} movies")
